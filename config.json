@@ -1,0 +1,9 @@
+{
+  "account": "",
+  "intervalMinutes": 60,
+  "groups": [],
+  "message": "",
+  "attachment": "",
+  "secondsBetweenGroups": 5,
+  "signalCli": ""
+}
