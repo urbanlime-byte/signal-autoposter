@@ -1,5 +1,5 @@
 # Signal Auto Poster
-$Version = '2.0.3'
+$Version = '2.0.4'
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -254,20 +254,27 @@ function Show-Qr($uri) {
   $f.Controls.Add($wb); $f.Show($Form)
   return $f
 }
+function Import-Linked {
+  $got = @()
+  foreach ($n in (Get-LinkedNumbers)) {
+    if (-not ($C.accounts | Where-Object { $_.number -eq $n })) { [void]$C.accounts.Add((New-Acct $n)); $got += $n; Log ('linked ' + $n) }
+  }
+  if ($got.Count) { Save-Config }
+  return ,$got
+}
 function Add-Phone {
   if (-not (Find-Cli)) { Log 'hit Setup first'; return }
-  $before = Get-LinkedNumbers
   Log 'making link code...'
   $script:qr = $null
   $tick = { param($fout) if (-not $script:qr -and (Test-Path $fout)) { try { $fs = New-Object IO.FileStream($fout, 'Open', 'Read', 'ReadWrite'); $sr = New-Object IO.StreamReader($fs); $t = $sr.ReadToEnd(); $sr.Close() } catch { $t = '' }; if ($t -match '(sgnl://\S+)') { $script:qr = Show-Qr $Matches[1]; Log 'scan the code with signal on ur phone now (settings > linked devices > +)' } } }
   $r = Invoke-Cli @('link', '-n', ('autoposter-' + $env:COMPUTERNAME)) '' 300 $tick
   if ($script:qr) { $script:qr.Close() }
-  if ($r.code -ne 0) { if (-not $script:qr) { Log ('link failed, no code came back: ' + (Why $r)) } else { Log 'link code ran out before it got scanned, hit Add phone and scan it quicker' }; return }
-  $after = Get-LinkedNumbers
-  $new = @($after | Where-Object { $before -notcontains $_ })
-  if (-not $new.Count) { $new = @($after | Where-Object { $n = $_; -not ($C.accounts | Where-Object { $_.number -eq $n }) }) }
-  foreach ($n in $new) { if (-not ($C.accounts | Where-Object { $_.number -eq $n })) { [void]$C.accounts.Add((New-Acct $n)) } ; Log ("linked " + $n) }
-  Save-Config; Fill-Accounts; if ($new.Count) { $Cmb.SelectedItem = $new[0] }
+  $added = Import-Linked
+  if ($r.out -match 'Associated with:?\s*(\+\d+)') { $n = $Matches[1]; if (-not ($C.accounts | Where-Object { $_.number -eq $n })) { [void]$C.accounts.Add((New-Acct $n)); $added += $n; Log ('linked ' + $n) } }
+  if ($added.Count) { Save-Config; Fill-Accounts; $Cmb.SelectedItem = $added[0]; Log 'now hit Refresh groups'; return }
+  if (-not $script:qr) { Log ('link failed, no code came back: ' + (Why $r)) }
+  elseif ($r.code -eq -2) { Log 'link code ran out before it got scanned, hit Add phone and try again' }
+  else { Log ('link didnt finish: ' + (Why $r)) }
 }
 
 # ---------- UI ----------
@@ -408,6 +415,7 @@ $Form.add_Shown({
   Log "opened v$Version"
   Clean-OldTemp
   $Num.Value = [math]::Min(1440, [math]::Max(10, $C.intervalMinutes))
+  if (Find-Cli) { [void](Import-Linked) }
   Fill-Accounts
   foreach ($a in $C.accounts) { if (Find-Cli) { [void](Get-Groups $a.number) } }
   Show-Acct
