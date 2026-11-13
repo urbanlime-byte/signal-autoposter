@@ -1,5 +1,5 @@
 # Signal Auto Poster
-$Version = '2.0.2'
+$Version = '2.0.3'
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -13,7 +13,7 @@ if (-not (Test-Path $TmpDir)) { New-Item -ItemType Directory $TmpDir | Out-Null 
 trap {
   $m = "Signal Auto Poster hit an error:`r`n$($_.Exception.Message)`r`n(line $($_.InvocationInfo.ScriptLineNumber))"
   try { Add-Content $LogPath $m -Encoding UTF8 } catch {}
-  [System.Windows.Forms.MessageBox]::Show($m, 'Signal Auto Poster') | Out-Null
+  if (-not $env:SAP_TEST) { [System.Windows.Forms.MessageBox]::Show($m, 'Signal Auto Poster') | Out-Null }
   break
 }
 
@@ -52,12 +52,13 @@ function Save-Config {
   Move-Item $tmp $CfgPath -Force
 }
 $C = Load-Config
+if ($env:SAP_UPDATEURL) { $C.updateUrl = $env:SAP_UPDATEURL }
 
 # ---------- log ----------
 function Log($t) {
   $line = (Get-Date -Format 'MM-dd HH:mm:ss') + '  ' + $t
   try { if ((Test-Path $LogPath) -and (Get-Item $LogPath).Length -gt 2MB) { Move-Item $LogPath "$LogPath.old" -Force } ; Add-Content $LogPath $line -Encoding UTF8 } catch {}
-  if ($script:LogBox) { $LogBox.AppendText($line + "`r`n"); if ($LogBox.Lines.Count -gt 800) { $LogBox.Lines = $LogBox.Lines[-400..-1] } }
+  if ($script:LogBox -and -not $LogBox.IsDisposed) { $LogBox.AppendText($line + "`r`n"); if ($LogBox.Lines.Count -gt 800) { $LogBox.Lines = $LogBox.Lines[-400..-1] } }
 }
 
 # ---------- disk ----------
@@ -100,7 +101,10 @@ function Invoke-Cli([string[]]$argv, [string]$stdin = '', [int]$timeout = 120, [
   [IO.File]::WriteAllBytes($fin, (New-Object Text.UTF8Encoding($false)).GetBytes($stdin))
   $env:JAVA_OPTS = '-Dfile.encoding=UTF-8 -Dstdin.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 "-Djava.io.tmpdir=' + $TmpDir + '"'
   $env:JAVA_TOOL_OPTIONS = $null
-  $line = '"' + (Q $bat) + ' ' + (($argv | ForEach-Object { Q $_ }) -join ' ') + ' < ' + (Q $fin) + ' > ' + (Q $fout) + ' 2> ' + (Q $ferr) + '"'
+  $lib = Join-Path (Split-Path -Parent (Split-Path -Parent $bat)) 'lib'
+  $exe = Q $bat
+  if ($bat -like '*\bin\signal-cli.bat' -and (Test-Path $lib)) { $exe = 'java ' + $env:JAVA_OPTS + ' --enable-native-access=ALL-UNNAMED -cp ' + (Q ($lib + '\*')) + ' org.asamk.signal.Main' }
+  $line = '"' + $exe + ' ' + (($argv | ForEach-Object { Q $_ }) -join ' ') + ' < ' + (Q $fin) + ' > ' + (Q $fout) + ' 2> ' + (Q $ferr) + '"'
   $psi = New-Object Diagnostics.ProcessStartInfo 'cmd.exe', ('/d /s /c ' + $line)
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.WorkingDirectory = $Dir
   $p = [Diagnostics.Process]::Start($psi)
@@ -191,11 +195,12 @@ function Check-Update([bool]$quiet) {
   try {
     $base = $C.updateUrl; if (-not $base.EndsWith('/')) { $base += '/' }
     $wc = New-Object Net.WebClient; $wc.Encoding = [Text.Encoding]::UTF8; $wc.Headers['Cache-Control'] = 'no-cache'
-    $v = $wc.DownloadString($base + 'version.txt?t=' + [DateTime]::Now.Ticks).Trim()
+    $bust = ''; if ($base -like 'http*') { $bust = '?t=' + [DateTime]::Now.Ticks }
+    $v = $wc.DownloadString($base + 'version.txt' + $bust).Trim()
     if ([version]$v -le [version]$Version) { if (-not $quiet) { Log ("ur on the newest version (" + $Version + ")") }; return }
     if ($quiet) { Log ("update " + $v + " is out, hit Update"); $BtnUpd.Text = "Update to $v"; return }
     $new = Join-Path $Dir 'autoposter.ps1.new'
-    $wc.DownloadFile($base + 'autoposter.ps1?t=' + [DateTime]::Now.Ticks, $new)
+    $wc.DownloadFile($base + 'autoposter.ps1' + $bust, $new)
     $errs = $null; [void][Management.Automation.Language.Parser]::ParseFile($new, [ref]$null, [ref]$errs)
     if ($errs.Count) { Remove-Item $new -Force; Log 'update download was broken, didnt install it'; return }
     Copy-Item $PSCommandPath (Join-Path $Dir 'autoposter.ps1.bak') -Force
@@ -254,7 +259,7 @@ function Add-Phone {
   $before = Get-LinkedNumbers
   Log 'making link code...'
   $script:qr = $null
-  $tick = { param($fout) if (-not $script:qr -and (Test-Path $fout)) { try { $fs = New-Object IO.FileStream($fout, 'Open', 'Read', 'ReadWrite'); $sr = New-Object IO.StreamReader($fs); $t = $sr.ReadToEnd(); $sr.Close() } catch { $t = '' }; if ($t -match '(sgnl://\S+)') { $script:qr = Show-Qr $Matches[1] } } }
+  $tick = { param($fout) if (-not $script:qr -and (Test-Path $fout)) { try { $fs = New-Object IO.FileStream($fout, 'Open', 'Read', 'ReadWrite'); $sr = New-Object IO.StreamReader($fs); $t = $sr.ReadToEnd(); $sr.Close() } catch { $t = '' }; if ($t -match '(sgnl://\S+)') { $script:qr = Show-Qr $Matches[1]; Log 'scan the code with signal on ur phone now (settings > linked devices > +)' } } }
   $r = Invoke-Cli @('link', '-n', ('autoposter-' + $env:COMPUTERNAME)) '' 300 $tick
   if ($script:qr) { $script:qr.Close() }
   if ($r.code -ne 0) { if (-not $script:qr) { Log ('link failed, no code came back: ' + (Why $r)) } else { Log 'link code ran out before it got scanned, hit Add phone and scan it quicker' }; return }
@@ -384,7 +389,7 @@ $BtnPic.add_Click({
 $BtnPicX.add_Click({ $a = Cur; if ($a) { $a.attachment = ''; Save-Config; Show-Acct } })
 $BtnNow.add_Click({ $BtnNow.Enabled = $false; try { Log 'posting now...'; Post-Round } finally { $BtnNow.Enabled = $true } })
 $BtnGo.add_Click({ if ($Timer.Enabled) { Stop-Posting } else { Start-Posting } })
-$BtnUpd.add_Click({ $BtnUpd.Enabled = $false; try { Check-Update $false } finally { $BtnUpd.Enabled = $true } })
+$BtnUpd.add_Click({ $BtnUpd.Enabled = $false; try { Check-Update $false } finally { if (-not $BtnUpd.IsDisposed) { $BtnUpd.Enabled = $true } } })
 
 $script:Quit = $false
 $script:TrayTip = $false
@@ -411,4 +416,8 @@ $Form.add_Shown({
 })
 
 if ($env:SAP_SELFTEST) { Fill-Accounts; Post-Round; exit }
+if ($env:SAP_TEST -eq 'setup') { Do-Setup; Log ('TEST setup cli=' + (Find-Cli) + ' java=' + (Java-Version)); exit }
+if ($env:SAP_TEST -eq 'update') { Check-Update $false; Log 'TEST update done'; exit }
+if ($env:SAP_TEST -eq 'link') { $Form.add_Shown({ Add-Phone; Log 'TEST link done' }) }
+if ($env:SAP_TEST -eq 'ui') { $k = New-Object Windows.Forms.Timer; $k.Interval = 8000; $k.add_Tick({ $k.Stop(); $script:Quit = $true; Log 'TEST ui ok'; $Form.Close() }); $k.Start() }
 [System.Windows.Forms.Application]::Run($Form)
