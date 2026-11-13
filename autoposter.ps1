@@ -1,5 +1,5 @@
 # Signal Auto Poster
-$Version = '2.0.4'
+$Version = '2.1.0'
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -23,13 +23,14 @@ if (-not $mutex.WaitOne(0)) { [System.Windows.Forms.MessageBox]::Show('its alrea
 # ---------- config ----------
 function New-Acct($num) { @{ number = $num; on = $true; groups = @(); message = ''; attachment = '' } }
 function Load-Config {
-  $c = @{ accounts = New-Object System.Collections.ArrayList; intervalMinutes = 60; secondsBetweenAccounts = 3; running = $false; updateUrl = 'https://raw.githubusercontent.com/urbanlime-byte/signal-autoposter/main/' }
+  $c = @{ accounts = New-Object System.Collections.ArrayList; intervalMinutes = 60; secondsBetweenAccounts = 3; secondsBetweenGroups = 10; running = $false; updateUrl = 'https://raw.githubusercontent.com/urbanlime-byte/signal-autoposter/main/' }
   if (Test-Path $CfgPath) {
     try { $j = Get-Content $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $j = $null }
     if ($j) {
       if ($j.intervalMinutes) { $c.intervalMinutes = [int]$j.intervalMinutes }
       if ($j.secondsBetweenAccounts -ne $null) { $c.secondsBetweenAccounts = [int]$j.secondsBetweenAccounts }
       if ($j.running) { $c.running = $true }
+      if ($j.secondsBetweenGroups -ne $null) { $c.secondsBetweenGroups = [int]$j.secondsBetweenGroups }
       if ($j.signalCli) { $script:CliOverride = [string]$j.signalCli }
       if ($j.accounts) {
         foreach ($a in @($j.accounts)) {
@@ -46,7 +47,7 @@ function Load-Config {
   return $c
 }
 function Save-Config {
-  $o = [ordered]@{ intervalMinutes = $C.intervalMinutes; secondsBetweenAccounts = $C.secondsBetweenAccounts; running = $C.running; accounts = @($C.accounts | ForEach-Object { [ordered]@{ number = $_.number; on = $_.on; groups = @($_.groups); message = $_.message; attachment = $_.attachment } }) }
+  $o = [ordered]@{ intervalMinutes = $C.intervalMinutes; secondsBetweenAccounts = $C.secondsBetweenAccounts; secondsBetweenGroups = $C.secondsBetweenGroups; running = $C.running; accounts = @($C.accounts | ForEach-Object { [ordered]@{ number = $_.number; on = $_.on; groups = @($_.groups); message = $_.message; attachment = $_.attachment } }) }
   $tmp = "$CfgPath.tmp"
   [IO.File]::WriteAllText($tmp, ($o | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
   Move-Item $tmp $CfgPath -Force
@@ -93,6 +94,7 @@ function Q($s) { '"' + ($s -replace '"', '') + '"' }
 function Invoke-Cli([string[]]$argv, [string]$stdin = '', [int]$timeout = 120, [scriptblock]$tick = $null) {
   $bat = Find-Cli
   if (-not $bat) { return @{ code = -1; out = ''; err = 'signal isnt set up yet, hit Setup' } }
+  Stop-Daemon
   Clean-Tmp
   $run = Join-Path $env:LOCALAPPDATA 'SignalAutoPoster'
   if (-not (Test-Path $run)) { New-Item -ItemType Directory $run | Out-Null }
@@ -124,6 +126,68 @@ function Invoke-Cli([string[]]$argv, [string]$stdin = '', [int]$timeout = 120, [
   if ($timedOut) { $err = "took too long, stopped it. $err" }
   return @{ code = $code; out = $out; err = $err }
 }
+# one signal-cli kept running in the background, so posts dont pay java startup + sync every time
+$script:D = $null; $script:RpcId = 0
+function Stop-Daemon {
+  if (-not $script:D) { return }
+  try { $script:D.client.Close() } catch {}
+  try { if (-not $script:D.proc.HasExited) { cmd.exe /d /c "taskkill /T /F /PID $($script:D.proc.Id) >nul 2>&1" } } catch {}
+  $script:D = $null
+}
+function Start-Daemon {
+  if ($script:D -and -not $script:D.proc.HasExited -and $script:D.client.Connected) { return $true }
+  Stop-Daemon
+  $bat = Find-Cli; if (-not $bat) { return $false }
+  $lib = Join-Path (Split-Path -Parent (Split-Path -Parent $bat)) 'lib'
+  if (-not ($bat -like '*\bin\signal-cli.bat' -and (Test-Path $lib))) { return $false }
+  Clean-Tmp
+  $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $port = $l.LocalEndpoint.Port; $l.Stop()
+  $run = Join-Path $env:LOCALAPPDATA 'SignalAutoPoster'; if (-not (Test-Path $run)) { New-Item -ItemType Directory $run | Out-Null }
+  $dl = Join-Path $run 'daemon.log'
+  $opts = '-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 "-Djava.io.tmpdir=' + $TmpDir + '"'
+  $env:JAVA_TOOL_OPTIONS = $null
+  $line = '"java ' + $opts + ' --enable-native-access=ALL-UNNAMED -cp ' + (Q ($lib + '\*')) + ' org.asamk.signal.Main daemon --tcp 127.0.0.1:' + $port + ' > ' + (Q $dl) + ' 2>&1"'
+  $psi = New-Object Diagnostics.ProcessStartInfo 'cmd.exe', ('/d /s /c ' + $line)
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.WorkingDirectory = $Dir
+  $p = [Diagnostics.Process]::Start($psi)
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  while ($sw.Elapsed.TotalSeconds -lt 120) {
+    [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+    if ($p.HasExited) { $t = ''; try { $t = Get-Content $dl -Raw } catch {}; Log ('signal didnt start: ' + (Why @{ code = 1; out = ''; err = $t })); return $false }
+    try {
+      $c = New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1', $port)
+      $enc = New-Object Text.UTF8Encoding($false); $s = $c.GetStream()
+      $w = New-Object IO.StreamWriter($s, $enc); $w.AutoFlush = $true; $w.NewLine = "`n"
+      $script:D = @{ proc = $p; client = $c; reader = (New-Object IO.StreamReader($s, $enc)); writer = $w; pending = $null }
+      Log ('signal connected (' + [int]$sw.Elapsed.TotalSeconds + 's)')
+      return $true
+    } catch {}
+  }
+  Log 'signal took too long to start'; cmd.exe /d /c "taskkill /T /F /PID $($p.Id) >nul 2>&1"; return $false
+}
+function Rpc($method, $params, [int]$timeout = 300) {
+  if (-not (Start-Daemon)) { return $null }
+  $script:InRpc = $true
+  try { return (Rpc-Inner $method $params $timeout) } finally { $script:InRpc = $false }
+}
+function Rpc-Inner($method, $params, [int]$timeout) {
+  $id = [string](++$script:RpcId)
+  $req = @{ jsonrpc = '2.0'; method = $method; params = $params; id = $id } | ConvertTo-Json -Depth 6 -Compress
+  try { $script:D.writer.WriteLine($req) } catch { Stop-Daemon; return @{ error = @{ message = 'lost connection to signal, trying again next round' } } }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  while ($true) {
+    if (-not $script:D.pending) { $script:D.pending = $script:D.reader.ReadLineAsync() }
+    while (-not $script:D.pending.IsCompleted) {
+      [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 30
+      if ($sw.Elapsed.TotalSeconds -gt $timeout) { Stop-Daemon; return @{ error = @{ message = 'took too long, restarting signal' } } }
+    }
+    if ($script:D.pending.IsFaulted) { Stop-Daemon; return @{ error = @{ message = 'lost connection to signal, trying again next round' } } }
+    $line = $script:D.pending.Result; $script:D.pending = $null
+    if ($null -eq $line) { Stop-Daemon; return @{ error = @{ message = 'signal stopped, trying again next round' } } }
+    try { $o = $line | ConvertFrom-Json } catch { continue }
+    if ([string]$o.id -eq $id) { return $o }
+  }
+}
 function First-Line($t) { $l = @(($t -split "`r?`n") | Where-Object { $_.Trim() -and $_ -notmatch '^\s+at ' -and $_ -notmatch 'Picked up' }); if ($l.Count) { $l[0].Trim() } else { '' } }
 function Why($r) {
   $t = $r.err + ' ' + $r.out
@@ -136,9 +200,15 @@ function Why($r) {
 }
 $Groups = @{}
 function Get-Groups($num) {
-  $r = Invoke-Cli @('-a', $num, '-o', 'json', 'listGroups') '' 120
-  if ($r.code -ne 0) { Log ("cant get groups for " + $num + ": " + (Why $r)); return $null }
-  try { $j = $r.out | ConvertFrom-Json } catch { Log 'groups came back weird, try Refresh groups again'; return $null }
+  $o = Rpc 'listGroups' @{ account = $num } 120
+  if ($o) {
+    if ($o.error) { Log ("cant get groups for " + $num + ": " + (Why @{ code = 1; out = ''; err = [string]$o.error.message })); return $null }
+    $j = $o.result
+  } else {
+    $r = Invoke-Cli @('-a', $num, '-o', 'json', 'listGroups') '' 120
+    if ($r.code -ne 0) { Log ("cant get groups for " + $num + ": " + (Why $r)); return $null }
+    try { $j = $r.out | ConvertFrom-Json } catch { Log 'groups came back weird, try Refresh groups again'; return $null }
+  }
   $g = @(@($j) | Where-Object { $_.isMember -ne $false -and $_.name } | ForEach-Object { @{ id = [string]$_.id; name = [string]$_.name } })
   $Groups[$num] = $g
   return $g
@@ -153,7 +223,6 @@ $script:Busy = $false
 function Post-Account($a) {
   if (-not $a.message.Trim() -and -not $a.attachment) { Log ($a.number + ': no ad written, skipping'); return }
   if (-not $a.groups.Count) { Log ($a.number + ': no groups ticked, skipping'); return }
-  [void](Invoke-Cli @('-a', $a.number, 'receive', '-t', '2', '--ignore-attachments') '' 90)
   $g = $Groups[$a.number]; if (-not $g) { $g = Get-Groups $a.number }; if (-not $g) { return }
   $ids = @(); $missing = @()
   foreach ($name in $a.groups) {
@@ -168,6 +237,23 @@ function Post-Account($a) {
     if (Test-Path -LiteralPath $a.attachment) { $argv += '-a'; $argv += $a.attachment } else { Log ($a.number + ': picture not found, sending text only') }
   }
   $sw = [Diagnostics.Stopwatch]::StartNew()
+  if (Start-Daemon) {
+    $ok = 0; $k = 0
+    foreach ($gid in $ids) {
+      if ($k -gt 0 -and $C.secondsBetweenGroups -gt 0) { $t = [DateTime]::Now.AddSeconds($C.secondsBetweenGroups); while ([DateTime]::Now -lt $t) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 } }
+      $k++
+      $gname = (@($g | Where-Object { $_.id -eq $gid }) | Select-Object -First 1).name
+      $p = @{ account = $a.number; groupId = $gid; message = $a.message }
+      if ($a.attachment -and (Test-Path -LiteralPath $a.attachment)) { $p.attachments = [string[]]@($a.attachment) }
+      $o = Rpc 'send' $p 300
+      if (-not $o) { Log ($a.number + ': lost signal, trying again next round'); break }
+      if ($o.error) { Log ($a.number + ' > ' + $gname + ': failed, ' + (Why @{ code = 1; out = ''; err = [string]$o.error.message })) }
+      else { $ok++; Log ($a.number + ' > ' + $gname + ': posted') }
+    }
+    Log ($a.number + ': done, ' + $ok + ' of ' + $ids.Count + ' groups in ' + [int]$sw.Elapsed.TotalSeconds + 's')
+    return
+  }
+  [void](Invoke-Cli @('-a', $a.number, 'receive', '-t', '2', '--ignore-attachments') '' 90)
   $r = Invoke-Cli $argv $a.message 300
   if ($r.code -eq 0) { Log ($a.number + ': posted to ' + $ids.Count + ' groups in ' + [int]$sw.Elapsed.TotalSeconds + 's') }
   else { Log ($a.number + ': send failed, ' + (Why $r)) }
@@ -207,6 +293,7 @@ function Check-Update([bool]$quiet) {
     Move-Item $new $PSCommandPath -Force
     Log ("updated to " + $v + ", restarting")
     Save-Config
+    Stop-Daemon
     $mutex.ReleaseMutex(); $mutex.Dispose()
     Start-Process 'wscript.exe' ('"' + (Join-Path $Dir 'Signal Auto Poster.vbs') + '"')
     $script:Quit = $true; $Form.Close()
@@ -215,6 +302,7 @@ function Check-Update([bool]$quiet) {
 
 # ---------- setup + link ----------
 function Do-Setup {
+  Stop-Daemon
   $jv = Java-Version
   if ($jv -lt 21) {
     $a = [System.Windows.Forms.MessageBox]::Show("signal needs Java 21 or newer (u have " + $(if ($jv) { $jv } else { 'none' }) + ").`r`ninstall it now? takes a minute", 'Setup', 'YesNo')
@@ -367,6 +455,20 @@ $Timer.add_Tick({
     Refresh-Status
   }
 })
+# keep reading what signal pushes (incoming messages) so the connection never backs up
+$script:Drain = New-Object Windows.Forms.Timer; $Drain.Interval = 2000
+$Drain.add_Tick({
+  if (-not $script:D -or $script:InRpc) { return }
+  try {
+    for ($i = 0; $i -lt 500; $i++) {
+      if (-not $script:D.pending) { $script:D.pending = $script:D.reader.ReadLineAsync() }
+      if (-not $script:D.pending.IsCompleted) { break }
+      if ($script:D.pending.IsFaulted -or $null -eq $script:D.pending.Result) { Stop-Daemon; break }
+      $script:D.pending = $null
+    }
+  } catch { Stop-Daemon }
+})
+$Drain.Start()
 function Start-Posting { Grab-Ui; $C.running = $true; Save-Config; $script:NextAt = [DateTime]::Now; $Timer.Start(); Log 'started'; Refresh-Status }
 function Stop-Posting { $Timer.Stop(); $C.running = $false; Save-Config; $script:NextAt = $null; Log 'stopped'; Refresh-Status }
 
@@ -410,7 +512,7 @@ $Form.add_FormClosing({
   }
   try { Grab-Ui } catch {}
 })
-$Form.add_FormClosed({ $Tray.Visible = $false; $Tray.Dispose() })
+$Form.add_FormClosed({ Stop-Daemon; $Tray.Visible = $false; $Tray.Dispose() })
 $Form.add_Shown({
   Log "opened v$Version"
   Clean-OldTemp
@@ -425,6 +527,7 @@ $Form.add_Shown({
 
 if ($env:SAP_SELFTEST) { Fill-Accounts; Post-Round; exit }
 if ($env:SAP_TEST -eq 'setup') { Do-Setup; Log ('TEST setup cli=' + (Find-Cli) + ' java=' + (Java-Version)); exit }
+if ($env:SAP_TEST -eq 'daemon') { $o = Rpc 'listAccounts' @{}; Log ('TEST daemon ' + $(if ($o) { ($o | ConvertTo-Json -Compress -Depth 4) } else { 'no daemon' })); $o2 = Rpc 'version' @{}; Log ('TEST daemon2 ' + $(if ($o2) { ($o2 | ConvertTo-Json -Compress -Depth 4) } else { 'none' })); Stop-Daemon; exit }
 if ($env:SAP_TEST -eq 'update') { Check-Update $false; Log 'TEST update done'; exit }
 if ($env:SAP_TEST -eq 'link') { $Form.add_Shown({ Add-Phone; Log 'TEST link done' }) }
 if ($env:SAP_TEST -eq 'ui') { $k = New-Object Windows.Forms.Timer; $k.Interval = 8000; $k.add_Tick({ $k.Stop(); $script:Quit = $true; Log 'TEST ui ok'; $Form.Close() }); $k.Start() }
